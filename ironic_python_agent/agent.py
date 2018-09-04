@@ -102,6 +102,7 @@ class IronicPythonAgentHeartbeater(threading.Thread):
         """Start the heartbeat thread."""
         # The first heartbeat happens immediately
         LOG.info('starting heartbeater')
+        LOG.info('dabadaba: This is the cern/rocky branch of the IPA')
         interval = 0
         self.agent.set_agent_advertise_addr()
 
