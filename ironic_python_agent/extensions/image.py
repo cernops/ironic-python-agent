@@ -17,6 +17,7 @@ import os
 import shlex
 import shutil
 import tempfile
+import time
 
 from oslo_concurrency import processutils
 from oslo_log import log
@@ -35,7 +36,7 @@ BIND_MOUNTS = ('/dev', '/proc')
 
 def _get_partition(device, uuid):
     """Find the partition of a given device."""
-    LOG.debug("Find the partition %(uuid)s on device %(dev)s",
+    LOG.info("Find the partition %(uuid)s on device %(dev)s",
               {'dev': device, 'uuid': uuid})
 
     try:
@@ -48,8 +49,16 @@ def _get_partition(device, uuid):
             LOG.warning("Couldn't re-read the partition table "
                         "on device %s", device)
 
+        # FIXME! If we get the partition ID of the md/p1 device, we should
+        # be able to find the partition rather than hardcoding it ...
+        if _is_md_device(device):
+            LOG.warning("FIXME: _get_partition() returns hard-coded partition")
+            return device + 'p1'
+        LOG.error("_get_partition() %s is not an md device", device)
+
         lsblk = utils.execute('lsblk', '-PbioKNAME,UUID,PARTUUID,TYPE', device)
         report = lsblk[0]
+
         for line in report.split('\n'):
             part = {}
             # Split into KEY=VAL pairs
@@ -81,6 +90,66 @@ def _get_partition(device, uuid):
         raise errors.CommandExecutionError(error_msg)
 
 
+def _is_md_device(device):
+    """Check if device is an md device"""
+    try:
+        utils.execute("mdadm --detail {}".format(device), shell=True)
+        LOG.info("%s is an md device", device)
+        return True
+    except processutils.ProcessExecutionError:
+        LOG.info("%s is not an md device", device)
+        return False
+ 
+
+def _md_get_components(device):
+    """Return the components of an md device"""
+    try:
+        cmd = ("mdadm --detail {}|"
+               "sed -e '1,/Number   Major/d'|"
+               "awk '{{print $NF}}'")
+        out, err = utils.execute(cmd.format(device), shell=True)
+    except processutils.ProcessExecutionError as e:
+        error_msg = ('Cannot get components of md device %(dev)s: %(err)s' %
+                     {'dev': device, 'err': e})
+        LOG.error(error_msg)
+        raise errors.CommandExecutionError(error_msg)
+    LOG.info("Components of %(dev)s: %(comp)s" %
+             {'dev': device, 'comp': ' '.join(out.splitlines())})
+    return out.splitlines()
+ 
+
+def _md_get_holders(device):
+    """Return the underlying disks for an md device"""
+    try:
+        cmd = ("mdadm --detail {}|"
+               "sed -e '1,/Number   Major/d'|"
+               "awk '{{print $NF}}'|"
+               "sed 's/[0-9]//g'")
+        out, err = utils.execute(cmd.format(device), shell=True)
+    except processutils.ProcessExecutionError as e:
+        error_msg = ('Cannot get holders of md device %(dev)s: %(err)s' % 
+                     {'dev': device, 'err': e})
+        LOG.error(error_msg)
+        raise errors.CommandExecutionError(error_msg)
+    LOG.info("Holders of %(dev)s: %(comp)s" %
+             {'dev': device, 'comp': ' '.join(out.splitlines())})
+    return out.splitlines()
+ 
+
+def _md_restart(device):
+    """Restart md device"""
+    try:
+        components = _md_get_components(device) 
+        utils.execute("mdadm --stop {}".format(device), shell=True)
+        utils.execute("mdadm --assemble {} {}".format(device, ' '.join(components)),
+                      shell=True)
+    except processutils.ProcessExecutionError as e:
+        error_msg = ('Could not restart md device %(dev)s: %(err)s' %
+                     {'dev': device, 'err': e})
+        LOG.error(error_msg)
+        raise errors.CommandExecutionError(error_msg)       
+
+
 def _install_grub2(device, root_uuid, efi_system_part_uuid=None,
                    prep_boot_part_uuid=None):
     """Install GRUB2 bootloader on a given device."""
@@ -102,6 +171,17 @@ def _install_grub2(device, root_uuid, efi_system_part_uuid=None,
         if prep_boot_part_uuid:
             device = _get_partition(device, uuid=prep_boot_part_uuid)
 
+        # If the root device is an md device (or partition), we need to
+        # restart the device to help grub find it and identify  the underlying
+        # disks to install grub
+        if _is_md_device(device):
+            _md_restart(device)
+            disks = _md_get_holders(device)
+        else:
+            disks.append(device)
+
+        LOG.info("Mount %(root_partition)s into %(path)s" %
+                 {'root_partition': root_partition, 'path': path})
         utils.execute('mount', root_partition, path)
         for fs in BIND_MOUNTS:
             utils.execute('mount', '-o', 'bind', fs, path + fs)
@@ -126,10 +206,15 @@ def _install_grub2(device, root_uuid, efi_system_part_uuid=None,
         path_variable = '%s:/bin:/usr/sbin' % path_variable
 
         # Install grub
-        utils.execute('chroot %(path)s /bin/sh -c '
-                      '"%(bin)s-install %(dev)s"' %
-                      {'path': path, 'bin': binary_name, 'dev': device},
-                      shell=True, env_variables={'PATH': path_variable})
+        LOG.info("GRUB2 will be installed on disks %s", disks)
+        for grub_disk in disks:
+            LOG.info("Installing on grub_disk %s", grub_disk)
+            utils.execute('chroot %(path)s /bin/sh -c '
+                          '"%(bin)s-install %(dev)s"' %
+                          {'path': path, 'bin': binary_name,
+                           'dev': grub_disk},
+                          shell=True, env_variables={'PATH': path_variable})
+            LOG.info("GRUB2 successfully installed on device %s", grub_disk)
         # Also run grub-install with --removable, this installs grub to the
         # EFI fallback path. Useful if the NVRAM wasn't written correctly,
         # was reset or if testing with virt as libvirt resets the NVRAM
@@ -151,13 +236,21 @@ def _install_grub2(device, root_uuid, efi_system_part_uuid=None,
                       {'path': path, 'bin': binary_name}, shell=True,
                       env_variables={'PATH': path_variable})
 
-        LOG.info("GRUB2 successfully installed on %s", device)
+        LOG.info("GRUB2 successfully installed for root device %s", device)
 
     except processutils.ProcessExecutionError as e:
         error_msg = ('Installing GRUB2 boot loader to device %(dev)s '
                      'failed with %(err)s.' % {'dev': device, 'err': e})
         LOG.error(error_msg)
-        raise errors.CommandExecutionError(error_msg)
+       
+        # arne 10SEP2018: wait until /tmp/ipa-done exists 
+        while not os.path.isfile("/tmp/ipa-done"):
+            LOG.info("Waiting until /tmp/ipa-done exists ...")
+            time.sleep(10)
+
+        # arne 11SEP2018: return success so that the machine can be
+        # debugged using a live image
+        # raise errors.CommandExecutionError(error_msg)
 
     finally:
         umount_warn_msg = "Unable to umount %(path)s. Error: %(error)s"
